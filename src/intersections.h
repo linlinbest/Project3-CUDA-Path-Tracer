@@ -380,3 +380,186 @@ __host__ __device__ float bvhIntersectionTest(const Geom* geoms, const BVHNode* 
 }
 
 #endif
+
+// USE SDF
+#if 1
+
+__host__ __device__
+float udfTriangle(glm::vec3 p, glm::vec3 a, glm::vec3 b, glm::vec3 c)
+{
+    glm::vec3 ba = b - a; glm::vec3 pa = p - a;
+    glm::vec3 cb = c - b; glm::vec3 pb = p - b;
+    glm::vec3 ac = a - c; glm::vec3 pc = p - c;
+    glm::vec3 nor = glm::cross(ba, ac);
+
+    glm::vec3 ba_pa = ba * glm::clamp(glm::dot(ba, pa) / glm::dot(ba, ba), 0.f, 1.f) - pa;
+    glm::vec3 cb_pb = cb * glm::clamp(glm::dot(cb, pb) / glm::dot(cb, cb), 0.f, 1.f) - pb;
+    glm::vec3 ac_pc = ac * glm::clamp(glm::dot(ac, pc) / glm::dot(ac, ac), 0.f, 1.f) - pc;
+
+    return glm::sqrt(
+        (glm::sign(glm::dot(glm::cross(ba, nor), pa)) +
+         glm::sign(glm::dot(glm::cross(cb, nor), pb)) +
+         glm::sign(glm::dot(glm::cross(ac, nor), pc)) < 2.f)
+        ?
+        glm::min(glm::min(
+            glm::dot(ba_pa, ba_pa),
+            glm::dot(cb_pb, cb_pb)),
+            glm::dot(ac_pc, ac_pc))
+        :
+        glm::dot(nor, pa) * glm::dot(nor, pa) / glm::dot(nor, nor));
+}
+
+
+//__global__ void generateSDF(const SDF* sdf, SDFGrid* SDFGrids, const BVHNode* bvhNodes, const int bvhNodes_size)
+//{
+//    int x = (blockIdx.x * blockDim.x) + threadIdx.x;
+//    int y = (blockIdx.y * blockDim.y) + threadIdx.y;
+//    int z = (blockIdx.z * blockDim.z) + threadIdx.z;
+//
+//    int idx = z * sdf->resolution.x * sdf->resolution.y + y * sdf->resolution.x + x;
+//
+//
+//    SDFGrids[idx].material;
+//}
+
+
+// brute force
+__global__ void generateSDF(const SDF* sdf, SDFGrid* SDFGrids, const Triangle* triangles, const int triangles_size, const Geom* geoms)
+{
+    int x = (blockIdx.x * blockDim.x) + threadIdx.x;
+    int y = (blockIdx.y * blockDim.y) + threadIdx.y;
+    int z = (blockIdx.z * blockDim.z) + threadIdx.z;
+
+    if (x >= sdf->resolution.x || y >= sdf->resolution.y || z >= sdf->resolution.z) return;
+    int idx = z * sdf->resolution.x * sdf->resolution.y + y * sdf->resolution.x + x;
+
+    /*float a = sdf->minCorner.x + sdf->gridExtent.x * 0.5f * float(x + 1);
+    float b = sdf->minCorner.y + sdf->gridExtent.y * 0.5f * float(y + 1);
+    float c = sdf->minCorner.z + sdf->gridExtent.z * 0.5f * float(z + 1);*/
+
+    glm::vec3 voxelPos = glm::vec3(sdf->minCorner.x + sdf->gridExtent.x * (float(x) + 0.5f),
+                                   sdf->minCorner.y + sdf->gridExtent.y * (float(y) + 0.5f),
+                                   sdf->minCorner.z + sdf->gridExtent.z * (float(z) + 0.5f));
+    const Triangle* minTriangle = nullptr;
+
+    float minUdf = FLT_MAX;
+    for (int i = 0; i < triangles_size; i++)
+    {
+        float udf = udfTriangle(voxelPos, triangles[i].point1, triangles[i].point2, triangles[i].point3);
+        if (udf < minUdf)
+        {
+            minUdf = udf;
+            minTriangle = triangles + i;
+        }
+    }
+
+    /*if (minUdf < 0.001f)
+    {
+        printf("%d, %d, %d, %.2f, %.2f, %.2f, %f\n", x, y, z, a, b, c, minUdf);
+    }*/
+
+    // will crash without this
+    if (minTriangle == nullptr) return;
+    int geomId = minTriangle->geomId;
+
+    glm::vec3 triCenter = (minTriangle->point1 + minTriangle->point2 + minTriangle->point3) / 3.f;
+    glm::vec3 worldNor = glm::normalize(triCenter - voxelPos);
+    glm::vec3 localNor = multiplyMV(geoms[geomId].inverseTransform, glm::vec4(worldNor, 0.f));
+
+    glm::vec3 localtriNor = multiplyMV(geoms[geomId].inverseTransform, glm::vec4(minTriangle->normal1, 0.f));
+    // if inside
+    if (glm::dot(localNor, localtriNor) > 0.f)
+    {
+        SDFGrids[idx].dist = -minUdf;
+        //printf("%d, %d, %d\n", x, y, z);
+    }
+    else
+    {
+        SDFGrids[idx].dist = minUdf;
+    }
+
+    ////////////////// ??
+    if (minUdf < 0.01f)
+    {
+        SDFGrids[idx].geomId = minTriangle->geomId;
+    }
+    else
+    {
+        SDFGrids[idx].geomId = -1;
+    }
+
+    SDFGrids[idx].geomId = minTriangle->geomId;
+    ////////////////
+
+    //printf("%d, %d, %d, %.2f\n", x, y, z, SDFGrids[idx].dist);
+    
+}
+
+
+
+__host__ __device__ const SDFGrid* sceneSDF(glm::vec3 pos, const SDF* sdf, const SDFGrid* SDFGrids)
+{
+    glm::ivec3 gridCoord = glm::floor((pos - sdf->minCorner) / sdf->gridExtent);
+    int idx = gridCoord.z * sdf->resolution.x * sdf->resolution.y + gridCoord.y * sdf->resolution.x + gridCoord.x;
+    if (gridCoord.x < 0 || gridCoord.y < 0 || gridCoord.z < 0
+        || gridCoord.x >= sdf->resolution.x || gridCoord.y >= sdf->resolution.y || gridCoord.z >= sdf->resolution.z) return nullptr;
+
+    return SDFGrids + idx;
+}
+
+
+glm::vec3 estimateNormal(glm::vec3 p, const SDF* sdf, const SDFGrid* SDFGrids)
+{
+    return glm::normalize(glm::vec3(
+        sceneSDF(glm::vec3(p.x + EPSILON, p.y, p.z), sdf, SDFGrids) - sceneSDF(glm::vec3(p.x - EPSILON, p.y, p.z), sdf, SDFGrids),
+        sceneSDF(glm::vec3(p.x, p.y + EPSILON, p.z), sdf, SDFGrids) - sceneSDF(glm::vec3(p.x, p.y - EPSILON, p.z), sdf, SDFGrids),
+        sceneSDF(glm::vec3(p.x, p.y, p.z + EPSILON), sdf, SDFGrids) - sceneSDF(glm::vec3(p.x, p.y, p.z - EPSILON), sdf, SDFGrids)
+    ));
+}
+
+
+__host__ __device__ float sdfIntersectionTest(const Geom* geoms, const SDF* sdf, const SDFGrid* SDFGrids,
+    const Ray& r, glm::vec3& intersectionPoint, glm::vec3& normal, bool& outside, int* hitGeomId)
+{
+    outside = true;
+    normal = glm::vec3(0.f, 0.f, 1.f);
+    //printf("%.2f\n", SDFGrids[31*64*64+31*64+31].dist);
+    float t = 2.f;
+    int maxMarchSteps = 64;
+    for (int i = 0; i < maxMarchSteps; i++)
+    {
+        glm::vec3 rayMarchPos = r.origin + r.direction * t;
+        const SDFGrid* currSDFGrid = sceneSDF(rayMarchPos, sdf, SDFGrids);
+        
+        // ??
+        if (currSDFGrid == nullptr)
+        {
+            t += 0.5f;
+            continue;
+        }
+
+        if (currSDFGrid->dist < 0.001f)
+        {
+            //printf("%d\n", i);
+            return t;
+        }
+
+        //t += 0.05f;
+
+        // Move along the view ray
+        t += currSDFGrid->dist;
+        *hitGeomId = currSDFGrid->geomId;
+        
+
+        if (t >= 100.f)
+        {
+            // Gone too far; give up
+            return 100.f;
+        }
+    }
+
+
+    return -1.f;
+}
+
+#endif

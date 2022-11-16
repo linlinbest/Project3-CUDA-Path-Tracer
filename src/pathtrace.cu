@@ -24,6 +24,7 @@
 #define CACHE_FIRST_INTERSECTION (1 && !ANTIALIASING)
 #define DENOISE_TIME 1
 #define EDGE_AVOIDING 1
+#define USE_SDF_INTERSECTION 1
 
 
 #define FILENAME (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
@@ -138,8 +139,19 @@ static Geom* dev_geoms = NULL;
 #if USE_BVH_FOR_INTERSECTION
 static BVHNode* dev_bvhNodes = NULL;
 static int bvhNodes_size = 0;
+
+#if USE_SDF_INTERSECTION
+static Triangle* dev_faces = NULL;
+#endif
+
 #else
 static Triangle* dev_faces = NULL;
+#endif
+
+#if USE_SDF_INTERSECTION
+static SDF* dev_SDF = NULL;
+static SDFGrid* dev_SDFGrids = NULL;
+static bool sdfGenerated = false;
 #endif
 
 static Material* dev_materials = NULL;
@@ -189,11 +201,22 @@ void pathtraceInit(Scene* scene) {
 #if USE_BVH_FOR_INTERSECTION
 	cudaMalloc(&dev_bvhNodes, bvhTree.bvhNodes.size() * sizeof(BVHNode));
 	cudaMemcpy(dev_bvhNodes, bvhTree.bvhNodes.data(), bvhTree.bvhNodes.size() * sizeof(BVHNode), cudaMemcpyHostToDevice);
-#else
+
+#if USE_SDF_INTERSECTION
+	for (int i = 0; i < scene->faces.size(); i++)
+	{
+		int geomId = scene->faces[i].geomId;
+		scene->faces[i].localToWorld(scene->geoms[geomId]);
+	}
+
 	cudaMalloc(&dev_faces, scene->faces.size() * sizeof(Triangle));
 	cudaMemcpy(dev_faces, scene->faces.data(), scene->faces.size() * sizeof(Triangle), cudaMemcpyHostToDevice);
 #endif
 
+#else
+	cudaMalloc(&dev_faces, scene->faces.size() * sizeof(Triangle));
+	cudaMemcpy(dev_faces, scene->faces.data(), scene->faces.size() * sizeof(Triangle), cudaMemcpyHostToDevice);
+#endif
 	cudaMalloc(&dev_geoms, scene->geoms.size() * sizeof(Geom));
 	cudaMemcpy(dev_geoms, scene->geoms.data(), scene->geoms.size() * sizeof(Geom), cudaMemcpyHostToDevice);
 
@@ -216,6 +239,34 @@ void pathtraceInit(Scene* scene) {
 
 	cudaMalloc(&dev_gBuffer, pixelcount * sizeof(GBufferPixel));
 
+
+#if USE_SDF_INTERSECTION
+	SDF sdf;
+	sdf.minCorner = glm::vec3(-3.f, 1.f, -3.f);
+	sdf.maxCorner = glm::vec3(3.f, 7.f, 3.f);
+	sdf.resolution = glm::ivec3(256);
+	sdf.gridExtent = (sdf.maxCorner - sdf.minCorner) / glm::vec3(sdf.resolution);
+
+	cudaMalloc(&dev_SDF, sizeof(SDF));
+	cudaMemcpy(dev_SDF, &sdf, sizeof(SDF), cudaMemcpyHostToDevice);
+
+	int gridCount = sdf.resolution.x * sdf.resolution.y * sdf.resolution.z;
+	cudaMalloc(&dev_SDFGrids, gridCount * sizeof(SDFGrid));
+
+	const dim3 blockSize3d(4, 4, 4);
+	const dim3 blocksPerGrid3d(
+		(sdf.resolution.x + blockSize3d.x - 1) / blockSize3d.x,
+		(sdf.resolution.y + blockSize3d.y - 1) / blockSize3d.y,
+		(sdf.resolution.z + blockSize3d.z - 1) / blockSize3d.z);
+
+	//generateSDF<<<blocksPerGrid3d, blockSize3d>>>(dev_SDF, dev_SDFGrids, dev_bvhNodes, bvhNodes_size);
+
+	// brute force
+	generateSDF <<<blocksPerGrid3d, blockSize3d >>> (dev_SDF, dev_SDFGrids, dev_faces, scene->faces.size(), dev_geoms);
+
+
+#endif
+
 	checkCUDAError("pathtraceInit");
 }
 
@@ -234,8 +285,18 @@ void pathtraceFree() {
 
 #if USE_BVH_FOR_INTERSECTION
 	cudaFree(dev_bvhNodes);
+
+#if USE_SDF_INTERSECTION
+	cudaFree(dev_faces);
+#endif
+
 #else
 	cudaFree(dev_faces);
+#endif
+
+#if USE_SDF_INTERSECTION
+	cudaFree(dev_SDF);
+	cudaFree(dev_SDFGrids);
 #endif
 
 	cudaFree(dev_gBuffer);
@@ -302,7 +363,10 @@ __global__ void computeIntersections(
 	, PathSegment* pathSegments
 	, Geom* geoms
 	, int geoms_size
-#if USE_BVH_FOR_INTERSECTION
+#if USE_SDF_INTERSECTION
+	, SDF* sdf
+	, SDFGrid* SDFGrids
+#elif USE_BVH_FOR_INTERSECTION
 	, BVHNode* bvhNodes
 	, int bvhNodes_size
 #else
@@ -325,7 +389,7 @@ __global__ void computeIntersections(
 		int hit_geom_index = -1;
 		bool outside = true;
 
-#if USE_BVH_FOR_INTERSECTION
+#if USE_BVH_FOR_INTERSECTION || USE_SDF_INTERSECTION
 		bool didBVHIntersection = false;
 #endif
 
@@ -347,11 +411,17 @@ __global__ void computeIntersections(
 				t = sphereIntersectionTest(geom, pathSegment.ray, tmp_intersect, tmp_normal, outside);
 			}
 			// TODO: add more intersection tests here... triangle? metaball? CSG?
-#if USE_BVH_FOR_INTERSECTION
+#if USE_BVH_FOR_INTERSECTION || USE_SDF_INTERSECTION
 			else if (!didBVHIntersection && geom.type == MESH)
 			{
 				didBVHIntersection = true;
+#if USE_BVH_FOR_INTERSECTION && !USE_SDF_INTERSECTION
 				t = bvhIntersectionTest(geoms, bvhNodes, bvhNodes_size, pathSegment.ray, tmp_intersect, tmp_normal, outside, &hit_geom_index);
+#endif
+				
+#if USE_SDF_INTERSECTION
+				t = sdfIntersectionTest(geoms, sdf, SDFGrids, pathSegment.ray, tmp_intersect, tmp_normal, outside, &hit_geom_index);
+#endif
 			}
 			else if (didBVHIntersection && geom.type == MESH)
 			{
@@ -467,6 +537,7 @@ __global__ void shadeMaterial(
 	}
 
 	// if the intersection exists...
+	if (intersection.materialId == -1) return;
 	Material material = materials[intersection.materialId];
 
 	// If the material indicates that the object was a light, "light" the ray
@@ -629,7 +700,11 @@ void pathtrace(int frame, int iter) {
 			cudaMemcpy(dev_intersectionsCache, dev_intersections, pixelcount * sizeof(ShadeableIntersection), cudaMemcpyDeviceToDevice);
 		}
 #else
-#if USE_BVH_FOR_INTERSECTION
+
+#if USE_SDF_INTERSECTION
+		computeIntersections << <numblocksPathSegmentTracing, blockSize1d >> > (
+			depth, num_paths, dev_paths, dev_geoms, hst_scene->geoms.size(), dev_SDF, dev_SDFGrids, dev_intersections);
+#elif USE_BVH_FOR_INTERSECTION
 		computeIntersections << <numblocksPathSegmentTracing, blockSize1d >> > (
 			depth, num_paths, dev_paths, dev_geoms, hst_scene->geoms.size(), dev_bvhNodes, bvhNodes_size, dev_intersections);
 #else

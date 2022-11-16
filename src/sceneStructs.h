@@ -60,6 +60,16 @@ struct Triangle {
         maxCorner = glm::max(globalPoint1, glm::max(globalPoint2, globalPoint3));
         centroid = (minCorner + maxCorner) * 0.5f;
     }
+
+    __host__ __device__ void localToWorld(const Geom& geom)
+    {
+        point1 = glm::vec3(geom.transform * glm::vec4(point1, 1.0f));
+        point2 = glm::vec3(geom.transform * glm::vec4(point2, 1.0f));
+        point3 = glm::vec3(geom.transform * glm::vec4(point3, 1.0f));
+        normal1 = glm::vec3(geom.transform * glm::vec4(normal1, 0.f));
+        normal2 = glm::vec3(geom.transform * glm::vec4(normal2, 0.f));
+        normal3 = glm::vec3(geom.transform * glm::vec4(normal3, 0.f));
+    }
 #endif
 };
 
@@ -116,4 +126,17 @@ struct GBufferPixel {
     float t;
     glm::vec3 pos;
     glm::vec3 nor;
+};
+
+struct SDF
+{
+    glm::vec3 minCorner;
+    glm::vec3 maxCorner;
+    glm::ivec3 resolution;
+    glm::vec3 gridExtent;
+};
+
+struct SDFGrid {
+    float dist;
+    int geomId;
 };
