@@ -241,28 +241,33 @@ void pathtraceInit(Scene* scene) {
 
 
 #if USE_SDF_INTERSECTION
-	SDF sdf;
-	sdf.minCorner = glm::vec3(-3.f, 1.f, -3.f);
-	sdf.maxCorner = glm::vec3(3.f, 7.f, 3.f);
-	sdf.resolution = glm::ivec3(256);
-	sdf.gridExtent = (sdf.maxCorner - sdf.minCorner) / glm::vec3(sdf.resolution);
+	if (!sdfGenerated)
+	{
+		sdfGenerated = true;
+		SDF sdf;
+		sdf.minCorner = glm::vec3(-5.5f, -0.5f, -5.5f);
+		sdf.maxCorner = glm::vec3(5.5f, 10.5f, 5.5f);
+		sdf.resolution = glm::ivec3(352);
+		sdf.gridExtent = (sdf.maxCorner - sdf.minCorner) / glm::vec3(sdf.resolution);
 
-	cudaMalloc(&dev_SDF, sizeof(SDF));
-	cudaMemcpy(dev_SDF, &sdf, sizeof(SDF), cudaMemcpyHostToDevice);
+		cudaMalloc(&dev_SDF, sizeof(SDF));
+		cudaMemcpy(dev_SDF, &sdf, sizeof(SDF), cudaMemcpyHostToDevice);
 
-	int gridCount = sdf.resolution.x * sdf.resolution.y * sdf.resolution.z;
-	cudaMalloc(&dev_SDFGrids, gridCount * sizeof(SDFGrid));
+		int gridCount = sdf.resolution.x * sdf.resolution.y * sdf.resolution.z;
+		cudaMalloc(&dev_SDFGrids, gridCount * sizeof(SDFGrid));
 
-	const dim3 blockSize3d(4, 4, 4);
-	const dim3 blocksPerGrid3d(
-		(sdf.resolution.x + blockSize3d.x - 1) / blockSize3d.x,
-		(sdf.resolution.y + blockSize3d.y - 1) / blockSize3d.y,
-		(sdf.resolution.z + blockSize3d.z - 1) / blockSize3d.z);
+		const dim3 blockSize3d(4, 4, 4);
+		const dim3 blocksPerGrid3d(
+			(sdf.resolution.x + blockSize3d.x - 1) / blockSize3d.x,
+			(sdf.resolution.y + blockSize3d.y - 1) / blockSize3d.y,
+			(sdf.resolution.z + blockSize3d.z - 1) / blockSize3d.z);
 
-	//generateSDF<<<blocksPerGrid3d, blockSize3d>>>(dev_SDF, dev_SDFGrids, dev_bvhNodes, bvhNodes_size);
+		//generateSDF<<<blocksPerGrid3d, blockSize3d>>>(dev_SDF, dev_SDFGrids, dev_bvhNodes, bvhNodes_size);
 
-	// brute force
-	generateSDF <<<blocksPerGrid3d, blockSize3d >>> (dev_SDF, dev_SDFGrids, dev_faces, scene->faces.size(), dev_geoms);
+		// brute force
+		generateSDF << <blocksPerGrid3d, blockSize3d >> > (dev_SDF, dev_SDFGrids, dev_faces, scene->faces.size(), dev_geoms);
+	}
+	
 
 
 #endif
@@ -295,8 +300,8 @@ void pathtraceFree() {
 #endif
 
 #if USE_SDF_INTERSECTION
-	cudaFree(dev_SDF);
-	cudaFree(dev_SDFGrids);
+	/*cudaFree(dev_SDF);
+	cudaFree(dev_SDFGrids);*/
 #endif
 
 	cudaFree(dev_gBuffer);
@@ -421,6 +426,7 @@ __global__ void computeIntersections(
 				
 #if USE_SDF_INTERSECTION
 				t = sdfIntersectionTest(geoms, sdf, SDFGrids, pathSegment.ray, tmp_intersect, tmp_normal, outside, &hit_geom_index);
+				//printf("%d\n",hit_geom_index);
 #endif
 			}
 			else if (didBVHIntersection && geom.type == MESH)
@@ -449,7 +455,7 @@ __global__ void computeIntersections(
 			}
 		}
 
-		if (hit_geom_index == -1)
+		if (hit_geom_index == -1 || t_min == FLT_MAX)
 		{
 			intersections[path_index].t = -1.0f;
 		}

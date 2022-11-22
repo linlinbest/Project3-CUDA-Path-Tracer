@@ -433,10 +433,6 @@ __global__ void generateSDF(const SDF* sdf, SDFGrid* SDFGrids, const Triangle* t
     if (x >= sdf->resolution.x || y >= sdf->resolution.y || z >= sdf->resolution.z) return;
     int idx = z * sdf->resolution.x * sdf->resolution.y + y * sdf->resolution.x + x;
 
-    /*float a = sdf->minCorner.x + sdf->gridExtent.x * 0.5f * float(x + 1);
-    float b = sdf->minCorner.y + sdf->gridExtent.y * 0.5f * float(y + 1);
-    float c = sdf->minCorner.z + sdf->gridExtent.z * 0.5f * float(z + 1);*/
-
     glm::vec3 voxelPos = glm::vec3(sdf->minCorner.x + sdf->gridExtent.x * (float(x) + 0.5f),
                                    sdf->minCorner.y + sdf->gridExtent.y * (float(y) + 0.5f),
                                    sdf->minCorner.z + sdf->gridExtent.z * (float(z) + 0.5f));
@@ -479,7 +475,7 @@ __global__ void generateSDF(const SDF* sdf, SDFGrid* SDFGrids, const Triangle* t
     }
 
     ////////////////// ??
-    if (minUdf < 0.01f)
+    if (minUdf < 0.5f)
     {
         SDFGrids[idx].geomId = minTriangle->geomId;
     }
@@ -488,6 +484,7 @@ __global__ void generateSDF(const SDF* sdf, SDFGrid* SDFGrids, const Triangle* t
         SDFGrids[idx].geomId = -1;
     }
 
+    // ?? bug ??
     SDFGrids[idx].geomId = minTriangle->geomId;
     ////////////////
 
@@ -508,12 +505,27 @@ __host__ __device__ const SDFGrid* sceneSDF(glm::vec3 pos, const SDF* sdf, const
 }
 
 
-glm::vec3 estimateNormal(glm::vec3 p, const SDF* sdf, const SDFGrid* SDFGrids)
+__host__ __device__ glm::vec3 estimateNormal(glm::vec3 p, const SDF* sdf, const SDFGrid* SDFGrids)
 {
+    const SDFGrid* currGrid = sceneSDF(p, sdf, SDFGrids);
+    if (currGrid == nullptr) return glm::vec3(0);
+    const SDFGrid* dx1Grid = sceneSDF(glm::vec3(p.x + sdf->gridExtent.x, p.y, p.z), sdf, SDFGrids);
+    float dx1 = dx1Grid == nullptr ? currGrid->dist : dx1Grid->dist;
+    const SDFGrid* dx2Grid = sceneSDF(glm::vec3(p.x - sdf->gridExtent.x, p.y, p.z), sdf, SDFGrids);
+    float dx2 = dx2Grid == nullptr ? currGrid->dist : dx2Grid->dist;
+    const SDFGrid* dy1Grid = sceneSDF(glm::vec3(p.x, p.y + sdf->gridExtent.y, p.z), sdf, SDFGrids);
+    float dy1 = dy1Grid == nullptr ? currGrid->dist : dy1Grid->dist;
+    const SDFGrid* dy2Grid = sceneSDF(glm::vec3(p.x, p.y - sdf->gridExtent.y, p.z), sdf, SDFGrids);
+    float dy2 = dy2Grid == nullptr ? currGrid->dist : dy2Grid->dist;
+    const SDFGrid* dz1Grid = sceneSDF(glm::vec3(p.x, p.y, p.z + sdf->gridExtent.z), sdf, SDFGrids);
+    float dz1 = dz1Grid == nullptr ? currGrid->dist : dz1Grid->dist;
+    const SDFGrid* dz2Grid = sceneSDF(glm::vec3(p.x, p.y, p.z - sdf->gridExtent.z), sdf, SDFGrids);
+    float dz2 = dz2Grid == nullptr ? currGrid->dist : dz2Grid->dist;
+
     return glm::normalize(glm::vec3(
-        sceneSDF(glm::vec3(p.x + EPSILON, p.y, p.z), sdf, SDFGrids) - sceneSDF(glm::vec3(p.x - EPSILON, p.y, p.z), sdf, SDFGrids),
-        sceneSDF(glm::vec3(p.x, p.y + EPSILON, p.z), sdf, SDFGrids) - sceneSDF(glm::vec3(p.x, p.y - EPSILON, p.z), sdf, SDFGrids),
-        sceneSDF(glm::vec3(p.x, p.y, p.z + EPSILON), sdf, SDFGrids) - sceneSDF(glm::vec3(p.x, p.y, p.z - EPSILON), sdf, SDFGrids)
+        dx1 - dx2,
+        dy1 - dy2,
+        dz1 - dz2
     ));
 }
 
@@ -521,11 +533,23 @@ glm::vec3 estimateNormal(glm::vec3 p, const SDF* sdf, const SDFGrid* SDFGrids)
 __host__ __device__ float sdfIntersectionTest(const Geom* geoms, const SDF* sdf, const SDFGrid* SDFGrids,
     const Ray& r, glm::vec3& intersectionPoint, glm::vec3& normal, bool& outside, int* hitGeomId)
 {
-    outside = true;
-    normal = glm::vec3(0.f, 0.f, 1.f);
-    //printf("%.2f\n", SDFGrids[31*64*64+31*64+31].dist);
-    float t = 2.f;
+    const SDFGrid* startGrid = sceneSDF(r.origin, sdf, SDFGrids);
+
+    //if (startGrid == nullptr) return -1.f;
+
+    if (startGrid == nullptr || startGrid->dist < 0.f) outside = false;
+    else outside = true;
+
+
+    normal = glm::vec3(0.f, 0.f, 0.f);
+    //normal = estimateNormal(r.origin, sdf, SDFGrids);
+
+    //float t = startGrid->dist;
+    float t = 0.2f;
+
     int maxMarchSteps = 64;
+    glm::vec3 lastRayMarchPos = r.origin;
+    int lastGeomId = -1;
     for (int i = 0; i < maxMarchSteps; i++)
     {
         glm::vec3 rayMarchPos = r.origin + r.direction * t;
@@ -534,22 +558,24 @@ __host__ __device__ float sdfIntersectionTest(const Geom* geoms, const SDF* sdf,
         // ??
         if (currSDFGrid == nullptr)
         {
-            t += 0.5f;
+            //return -1.f;
+            t += 0.25f;
             continue;
         }
 
-        if (currSDFGrid->dist < 0.001f)
+        if (currSDFGrid->dist < 0.01f)
         {
-            //printf("%d\n", i);
+            intersectionPoint = lastRayMarchPos;
+            normal = estimateNormal(lastRayMarchPos, sdf, SDFGrids);
+            *hitGeomId = lastGeomId;
+            
             return t;
         }
 
-        //t += 0.05f;
-
         // Move along the view ray
         t += currSDFGrid->dist;
-        *hitGeomId = currSDFGrid->geomId;
-        
+        lastGeomId = currSDFGrid->geomId;
+        lastRayMarchPos = rayMarchPos;
 
         if (t >= 100.f)
         {
